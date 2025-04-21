@@ -39,7 +39,6 @@ int main(int argc, char *argv[])
     int writeStrLen = (int)strlen(writeStr);
 
     /* Open the file for writing (O_WRONLY), create if it doesn't exist (O_CREAT), truncate (O_TRUNC) if it does */
-    // Use mode 0644: rw-r--r--
     int fd = open(writeFile, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd == -1)
     {
