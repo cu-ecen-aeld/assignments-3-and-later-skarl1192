@@ -3,6 +3,9 @@
 #include <syslog.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h> 
 
 /**
  * @brief Creates a file and writes a string to it.
@@ -33,10 +36,12 @@ int main(int argc, char *argv[])
 
     const char *writeFile = argv[1];
     const char *writeStr = argv[2];
+    int writeStrLen = (int)strlen(writeStr);
 
-    /* Open the file for writing */
-    FILE *filePtr = fopen(writeFile, "w");
-    if (filePtr == NULL)
+    /* Open the file for writing (O_WRONLY), create if it doesn't exist (O_CREAT), truncate (O_TRUNC) if it does */
+    // Use mode 0644: rw-r--r--
+    int fd = open(writeFile, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd == -1)
     {
         int savedErrno = errno; // Store errno before other system calls
         syslog(LOG_ERR, "Failed to open file %s for writing: %s", writeFile, strerror(savedErrno));
@@ -46,12 +51,13 @@ int main(int argc, char *argv[])
     }
 
     /* Write the string to the file */
-    if (fprintf(filePtr, "%s", writeStr) < 0)
+    int bytesWritten = write(fd, writeStr, writeStrLen);
+    if (bytesWritten != writeStrLen)
     {
         int savedErrno = errno; // Store errno before other calls
         syslog(LOG_ERR, "Failed to write string to file %s: %s", writeFile, strerror(savedErrno));
         fprintf(stderr, "Error writing to file %s: %s\n", writeFile, strerror(savedErrno));
-        fclose(filePtr);
+        close(fd);
         closelog();
         return 1;
     }
@@ -60,7 +66,7 @@ int main(int argc, char *argv[])
     syslog(LOG_DEBUG, "Writing %s to %s", writeStr, writeFile);
 
     /* Close the file */
-    if (fclose(filePtr) != 0)
+    if (close(fd) == -1)
     {
         int savedErrno = errno; // Store errno before other calls
         syslog(LOG_ERR, "Failed to close file %s: %s", writeFile, strerror(savedErrno));
