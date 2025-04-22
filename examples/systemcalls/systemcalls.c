@@ -33,26 +33,30 @@ bool do_system(const char *cmd)
     }
     else
     {
-        /* Check if the command executed by the shell terminated normally */
+
+        /* The system call spawns the child process and waits for it -
+         * The return value of the system call is the exit status of the child process */
+
+        /* Check if the child process terminated normally */
         if(WIFEXITED(rtn))
         {
-            /* Get the exit status returned by the shell command */
+            /* Get the exit status returned by the child process */
             if(WEXITSTATUS(rtn) == 0)
             {
-                /* Shell command terminated successfully */
+                /* Child process terminated successfully */
                 return true;
             }
             else
             {
-                /* Shell command terminated with an error */
-                fprintf(stderr, "Error shell command terminated with status: %d\n", WEXITSTATUS(rtn));
+                /* Child process terminated with an error */
+                fprintf(stderr, "Error child process terminated with status: %d\n", WEXITSTATUS(rtn));
                 return false;
             }
         }
         else
         {
-            /* Shell command terminated abnormally */
-            fprintf(stderr, "Error shell command terminated abnormally\n");
+            /* Child process terminated abnormally */
+            fprintf(stderr, "Error child process terminated abnormally\n");
             return false;
         }
     }
