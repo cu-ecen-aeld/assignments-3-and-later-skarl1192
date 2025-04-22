@@ -49,8 +49,9 @@ then
 	fi
 fi
 
-make clean
-make
+# Remove make step for assignment 3 part 1
+#make clean
+#make
 
 for i in $( seq 1 $NUMFILES)
 do
