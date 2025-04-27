@@ -39,7 +39,7 @@ int main(int argc, char *argv[])
     int writeStrLen = (int)strlen(writeStr);
 
     /* Open the file for writing (O_WRONLY), create if it doesn't exist (O_CREAT), truncate (O_TRUNC) if it does */
-    int fd = open(writeFile, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = open(writeFile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd == -1)
     {
         int savedErrno = errno; // Store errno before other system calls
