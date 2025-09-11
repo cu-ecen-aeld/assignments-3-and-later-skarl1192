@@ -16,14 +16,35 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <pthread.h>
+#include <time.h>
+#include <signal.h>
+#include <sys/time.h>
 
 /* ---- Macros ---- */
 #define SERVER_PORT 9000
 #define BUFFER_SIZE 40000
 #define PACKET_FILE "/var/tmp/aesdsocketdata"
 
+/* ---- Thread Data Structure ---- */
+struct thread_data {
+    pthread_t thread_id;
+    int client_fd;
+    struct sockaddr_in client_addr;
+    bool thread_complete;
+    struct thread_data *next;
+};
+
 /* ---- Global Variables ---- */
 bool IntTermSignaled = false;
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct thread_data *thread_list_head = NULL;
+pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_t timer_thread_id;
+timer_t timer_id;
+
+/* Function declarations */
+static int send_file_to_client(int socketFd);
 
 
 static void signal_handler(int signalNumber)
@@ -35,8 +56,231 @@ static void signal_handler(int signalNumber)
     }
 }
 
+/* Timer signal handler for timestamp writing */
+static void timer_handler(int sig, siginfo_t *si, void *uc)
+{
+    /* This handler is triggered by the timer */
+    /* The actual work is done in timer_thread function */
+    (void)sig;
+    (void)si; 
+    (void)uc;
+}
+
+/* Timer thread function */
+static void* timer_thread(void* arg)
+{
+    (void)arg; /* Unused parameter */
+    
+    struct sigevent sev;
+    struct itimerspec its;
+    sigset_t mask;
+    struct sigaction sa;
+    
+    /* Setup signal handler for timer */
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = timer_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGRTMIN, &sa, NULL) == -1) {
+        syslog(LOG_ERR, "Error setting up timer signal handler: %s", strerror(errno));
+        return NULL;
+    }
+    
+    /* Block SIGRTMIN for all threads except this one */
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGRTMIN);
+    
+    /* Create timer */
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGRTMIN;
+    sev.sigev_value.sival_ptr = &timer_id;
+    if (timer_create(CLOCK_REALTIME, &sev, &timer_id) == -1) {
+        syslog(LOG_ERR, "Error creating timer: %s", strerror(errno));
+        return NULL;
+    }
+    
+    /* Setup timer to fire every 10 seconds */
+    its.it_value.tv_sec = 10;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = 10;
+    its.it_interval.tv_nsec = 0;
+    
+    if (timer_settime(timer_id, 0, &its, NULL) == -1) {
+        syslog(LOG_ERR, "Error setting timer: %s", strerror(errno));
+        timer_delete(timer_id);
+        return NULL;
+    }
+    
+    /* Wait for timer signals and write timestamps */
+    struct timespec timeout = {1, 0}; /* 1 second timeout */
+    while (!IntTermSignaled) {
+        int result = sigtimedwait(&mask, NULL, &timeout);
+        if (result == SIGRTMIN) {
+            /* Get current time */
+            time_t current_time;
+            struct tm *time_info;
+            char timestamp_buffer[200];
+            
+            time(&current_time);
+            time_info = localtime(&current_time);
+            
+            /* Format timestamp according to RFC 2822 */
+            strftime(timestamp_buffer, sizeof(timestamp_buffer), 
+                    "timestamp:%a, %d %b %Y %H:%M:%S %z\n", time_info);
+            
+            /* Lock mutex and write timestamp to file */
+            pthread_mutex_lock(&file_mutex);
+            FILE* timestamp_file = fopen(PACKET_FILE, "a");
+            if (timestamp_file != NULL) {
+                fwrite(timestamp_buffer, 1, strlen(timestamp_buffer), timestamp_file);
+                fclose(timestamp_file);
+            } else {
+                syslog(LOG_ERR, "Error opening file for timestamp: %s", strerror(errno));
+            }
+            pthread_mutex_unlock(&file_mutex);
+        } else if (result == -1 && errno == EAGAIN) {
+            /* Timeout occurred - check IntTermSignaled and continue */
+            continue;
+        } else if (result == -1) {
+            /* Other error occurred */
+            syslog(LOG_ERR, "Error in sigtimedwait: %s", strerror(errno));
+            break;
+        }
+    }
+    
+    /* Cleanup timer */
+    timer_delete(timer_id);
+    return NULL;
+}
+
+/* Thread function to handle client connections */
+static void* handle_client(void* arg)
+{
+    struct thread_data* thread_info = (struct thread_data*)arg;
+    int clientFd = thread_info->client_fd;
+    char clientIpStr[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &(thread_info->client_addr.sin_addr), clientIpStr, INET_ADDRSTRLEN);
+    
+    /* Set socket timeout to allow periodic checking of IntTermSignaled */
+    struct timeval timeout;
+    timeout.tv_sec = 1;  /* 1 second timeout */
+    timeout.tv_usec = 0;
+    if (setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        syslog(LOG_ERR, "Error setting socket timeout: %s", strerror(errno));
+    }
+    
+    /* Receive and process data on the accepted client connection */
+    char receiveBuffer[BUFFER_SIZE];
+    size_t receiveBufferLen = 0;
+    ssize_t bytesReceived = 0;
+    bool clientConnected = true;
+
+    /* While client is connected and SIGINT/SIGTERM not received */
+    while (clientConnected && !IntTermSignaled)
+    {
+        bytesReceived = recv(clientFd, receiveBuffer, sizeof(receiveBuffer), 0);
+
+        if(bytesReceived == -1)
+        {
+            /* Error receiving data */
+            if(errno == EINTR) continue; /* Interrupted by signal */
+            if(errno == EAGAIN || errno == EWOULDBLOCK) continue; /* Timeout - check IntTermSignaled */
+            clientConnected = false;
+        }
+        else if(bytesReceived == 0)
+        {
+            /* Client closed the connection */
+            clientConnected = false;
+        }
+        else
+        {
+            /* Data received */
+            receiveBufferLen += bytesReceived;
+
+            /* Check for newline character(s) in the buffer */
+            char *newlineCharPtr = NULL;
+            while ((newlineCharPtr = memchr(receiveBuffer, '\n', receiveBufferLen)) != NULL)
+            {
+                /* Found end of packet, signified by the newline character */
+                size_t packetLen = (newlineCharPtr - receiveBuffer) + 1;
+
+                /* Lock mutex before writing to file */
+                pthread_mutex_lock(&file_mutex);
+                
+                /* Create/Open the data file to write/append to */
+                FILE* outputFilePtr = fopen(PACKET_FILE, "a");
+                if(outputFilePtr == NULL)
+                {
+                    syslog(LOG_ERR, "Error %d (%s) opening %s for appending", errno, strerror(errno), PACKET_FILE);
+                    pthread_mutex_unlock(&file_mutex);
+                    clientConnected = false;
+                    break; // break from newline processing loop
+                }
+
+                /* Append to file, including the newline character */
+                fwrite(receiveBuffer, 1, packetLen, outputFilePtr);
+                fclose(outputFilePtr);
+
+                /* Send file to client */
+                if(send_file_to_client(clientFd) != 0)
+                {
+                    /* Error sending file content, assume client disconnected */
+                    pthread_mutex_unlock(&file_mutex);
+                    clientConnected = false;
+                    break; // break from newline processing loop
+                }
+
+                /* Unlock mutex after file operations */
+                pthread_mutex_unlock(&file_mutex);
+
+                /* Remove processed packet from buffer */
+                size_t remainingLen = receiveBufferLen - packetLen;
+                if(remainingLen > 0)
+                {
+                    memmove(receiveBuffer, receiveBuffer + packetLen, remainingLen);
+                }
+                receiveBufferLen = remainingLen;
+            }
+
+            /* If there are remaining bytes in the buffer, write them to file
+             * Don't send the file to the connected client until full packet */
+            if(receiveBufferLen > 0)
+            {
+                /* Lock mutex before writing to file */
+                pthread_mutex_lock(&file_mutex);
+                
+                FILE* outputFilePtr = fopen(PACKET_FILE, "a");
+                if(outputFilePtr == NULL)
+                {
+                    syslog(LOG_ERR, "Error %d (%s) opening %s for appending", errno, strerror(errno), PACKET_FILE);
+                    pthread_mutex_unlock(&file_mutex);
+                    clientConnected = false;
+                }
+                else
+                {
+                    fwrite(receiveBuffer, 1, receiveBufferLen, outputFilePtr);
+                    fclose(outputFilePtr);
+                    pthread_mutex_unlock(&file_mutex);
+                    receiveBufferLen = 0;
+                }
+            }
+        }
+    }
+
+    /* Cleanup after client disconnection */
+    if(clientFd != -1)
+    {
+        close(clientFd);
+        syslog(LOG_INFO, "Closed connection from %s", clientIpStr);
+    }
+
+    /* Mark thread as complete */
+    thread_info->thread_complete = true;
+    
+    return NULL;
+}
+
 /* Send the packet file to the client */
-static int sendfile(int socketFd)
+static int send_file_to_client(int socketFd)
 {
     FILE *readFile = fopen(PACKET_FILE, "r");
     if(readFile == NULL)
@@ -73,6 +317,63 @@ static int sendfile(int socketFd)
 
     fclose(readFile);
     return 0;
+}
+
+/* Cleanup completed threads */
+static void cleanup_completed_threads(void)
+{
+    struct thread_data *thread_entry, *prev_entry = NULL;
+    
+    pthread_mutex_lock(&thread_list_mutex);
+    thread_entry = thread_list_head;
+    
+    while(thread_entry != NULL)
+    {
+        if(thread_entry->thread_complete)
+        {
+            pthread_join(thread_entry->thread_id, NULL);
+            
+            /* Remove from list */
+            if(prev_entry == NULL)
+            {
+                thread_list_head = thread_entry->next;
+            }
+            else
+            {
+                prev_entry->next = thread_entry->next;
+            }
+            
+            struct thread_data *temp = thread_entry;
+            thread_entry = thread_entry->next;
+            free(temp);
+        }
+        else
+        {
+            prev_entry = thread_entry;
+            thread_entry = thread_entry->next;
+        }
+    }
+    pthread_mutex_unlock(&thread_list_mutex);
+}
+
+/* Cleanup all threads and wait for them to complete */
+static void cleanup_all_threads(void)
+{
+    struct thread_data *thread_entry, *temp_entry;
+    
+    pthread_mutex_lock(&thread_list_mutex);
+    thread_entry = thread_list_head;
+    
+    while(thread_entry != NULL)
+    {
+        pthread_join(thread_entry->thread_id, NULL);
+        temp_entry = thread_entry->next;
+        free(thread_entry);
+        thread_entry = temp_entry;
+    }
+    
+    thread_list_head = NULL;
+    pthread_mutex_unlock(&thread_list_mutex);
 }
 
 
@@ -203,9 +504,30 @@ int main(int argc, char *argv[])
         syslog(LOG_INFO, "aesdsocket started as a daemon.");
     }
 
+    /* Block SIGRTMIN signal for all threads. In the timer thread we will explicitly wait for it.
+     * Note: The signal is delivered to the process, not to a specific thread.
+     * The kernel picks ONE thread to handle the signal so we must block it on all
+     * threads and explicity wait for it in the timer thread. */
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGRTMIN);
+    if (pthread_sigmask(SIG_BLOCK, &mask, NULL) != 0) {
+        syslog(LOG_ERR, "Error blocking SIGRTMIN: %s", strerror(errno));
+        close(serverFd);
+        closelog();
+        return -1;
+    }
+
+    /* Create timer thread */
+    if (pthread_create(&timer_thread_id, NULL, timer_thread, NULL) != 0) {
+        syslog(LOG_ERR, "Error creating timer thread: %s", strerror(errno));
+        close(serverFd);
+        closelog();
+        return -1;
+    }
 
     /* Listen for incoming connections */
-    if(listen(serverFd, 1) == -1)
+    if(listen(serverFd, 100) == -1)
     {
         syslog(LOG_ERR, "Error %d (%s) socket listen failed", errno, strerror(errno));
         close(serverFd);
@@ -226,7 +548,9 @@ int main(int argc, char *argv[])
         int clientFd = accept(serverFd, (struct sockaddr *)&clientAddr, &clientAddrLen);
         if(clientFd == -1)
         {
-            /* If accept() fails, try again until SIGINT/SIGTERM is received */
+            /* If accept() fails, check if it's due to signal interruption */
+            if(errno == EINTR) continue; /* Interrupted by signal, check IntTermSignaled */
+            /* Other errors, try again until SIGINT/SIGTERM is received */
             continue;
         }
 
@@ -235,105 +559,45 @@ int main(int argc, char *argv[])
         inet_ntop(AF_INET, &(clientAddr.sin_addr), clientIpStr, INET_ADDRSTRLEN);
         syslog(LOG_INFO, "Accepted connection from %s", clientIpStr);
 
-        /* Receive and process data on the accpeted client connection */
-        char receiveBuffer[BUFFER_SIZE];
-        size_t receiveBufferLen = 0;
-        ssize_t bytesReceived = 0;
-        bool clientConnected = true;
-
-        /* Create/Open the data file to write/append to */
-        FILE* outputFilePtr = fopen(PACKET_FILE, "a");
-        if(outputFilePtr == NULL)
+        /* Create thread data structure */
+        struct thread_data *new_thread = malloc(sizeof(struct thread_data));
+        if(new_thread == NULL)
         {
-            syslog(LOG_ERR, "Error %d (%s) opening %s for appending", errno, strerror(errno), PACKET_FILE);
-            clientConnected = false;
-        }
-
-        /* While client is connected and SIGINT/SIGTERM not received */
-        while (clientConnected && !IntTermSignaled)
-        {
-            bytesReceived = recv(clientFd, receiveBuffer, sizeof(receiveBuffer), 0);
-
-            if(bytesReceived == -1)
-            {
-                /* Error receiving data */
-                if(errno == EINTR) continue; // Interrupted by signal
-                clientConnected = false;
-            }
-            else if(bytesReceived == 0)
-            {
-                /* Client closed the connection */
-                clientConnected = false;
-            }
-            else
-            {
-                /* Data received */
-                receiveBufferLen += bytesReceived;
-
-                /* Check for newline character(s) in the buffer */
-                char *newlineCharPtr = NULL;
-                while ((newlineCharPtr = memchr(receiveBuffer, '\n', receiveBufferLen)) != NULL)
-                {
-                    /* Found end of packet, signified by the newline character */
-                    size_t packetLen = (newlineCharPtr - receiveBuffer) + 1;
-
-                    /* Append to file, including the newline character */
-                    fwrite(receiveBuffer, 1, packetLen, outputFilePtr);
-
-                    /* Close file so the send function can open it and read from it */
-                    fclose(outputFilePtr);
-                    outputFilePtr = NULL;
-
-                    /* Send file to client */
-                    if(sendfile(clientFd) == -1)
-                    {
-                        /* Error sending file content, assume client disconnected */
-                        clientConnected = false;
-                        break; // break from newline processing loop
-                    }
-
-                    /* Reopen the file for appending */
-                    outputFilePtr = fopen(PACKET_FILE, "a");
-                    if(outputFilePtr == NULL)
-                    {
-                        syslog(LOG_ERR, "Error %d (%s) opening %s for appending", errno, strerror(errno), PACKET_FILE);
-                        clientConnected = false;
-                        break; // break from newline processing loop
-                    }
-
-                    /* Remove processed packet from buffer */
-                    size_t remainingLen = receiveBufferLen - packetLen;
-                    if(remainingLen > 0)
-                    {
-                        memmove(receiveBuffer, receiveBuffer + packetLen, remainingLen);
-                    }
-                    receiveBufferLen = remainingLen;
-                }
-
-                /* If there are remaining bytes in the buffer, append them to the file 
-                 * Don't send the file to the connected client until full*/
-                if(receiveBufferLen > 0)
-                {
-                    fwrite(receiveBuffer, 1, receiveBufferLen, outputFilePtr);
-                    receiveBufferLen = 0;
-                }
-            }
-        }
-
-        /* Cleanup after client disconnection */
-        if(outputFilePtr != NULL)
-        {
-            fclose(outputFilePtr);
-            outputFilePtr = NULL;
-        }
-
-        if(clientFd != -1)
-        {
+            syslog(LOG_ERR, "Error %d (%s) malloc failed for thread data", errno, strerror(errno));
             close(clientFd);
-            clientFd = -1;
-            syslog(LOG_INFO, "Closed connection from %s", clientIpStr);
+            continue;
         }
+
+        new_thread->client_fd = clientFd;
+        new_thread->client_addr = clientAddr;
+        new_thread->thread_complete = false;
+        new_thread->next = NULL;
+
+        /* Create thread to handle client connection */
+        int thread_result = pthread_create(&new_thread->thread_id, NULL, handle_client, new_thread);
+        if(thread_result != 0)
+        {
+            syslog(LOG_ERR, "Error %d (%s) pthread_create failed", thread_result, strerror(thread_result));
+            close(clientFd);
+            free(new_thread);
+            continue;
+        }
+
+        /* Add thread to list */
+        pthread_mutex_lock(&thread_list_mutex);
+        new_thread->next = thread_list_head;
+        thread_list_head = new_thread;
+        pthread_mutex_unlock(&thread_list_mutex);
+
+        /* Cleanup completed threads periodically */
+        cleanup_completed_threads();
     }
+
+    /* Wait for all threads to complete */
+    cleanup_all_threads();
+
+    /* Wait for timer thread to complete */
+    pthread_join(timer_thread_id, NULL);
 
     /* Close server socket */
     syslog(LOG_INFO, "Shutting down server.");

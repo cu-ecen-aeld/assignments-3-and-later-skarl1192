@@ -8,6 +8,7 @@ CC = $(CROSS_COMPILE)gcc
 
 # Compiler flags
 CFLAGS = -Wall -g
+LDFLAGS = -lpthread -lrt
 
 # Target executable/binary name
 TARGET = aesdsocket
@@ -22,7 +23,7 @@ all: $(TARGET)
 # The target executable/binary depends on the object files
 # Rule to link the object file into the target executable/binary
 $(TARGET): $(OBJ)
-	$(CC) $(CFLAGS) $(OBJ) -o $(TARGET)
+	$(CC) $(CFLAGS) $(OBJ) -o $(TARGET) $(LDFLAGS)
 
 # The object files depend on the source files
 # Rule to compile the .c files into the .o files
