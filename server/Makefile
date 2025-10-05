@@ -4,11 +4,11 @@
 # make variable CROSS_COMPILE is not specified on the make command line.
 # When CROSS_COMPILE is specified with aarch64-none-linux-gnu- (note the
 # trailing -)the makefile compiles using the cross compiler.
-CC = $(CROSS_COMPILE)gcc
+CC ?= $(CROSS_COMPILE)gcc
 
 # Compiler flags
-CFLAGS = -Wall -g
-LDFLAGS = -lpthread -lrt
+CFLAGS ?= -Wall -g
+LDFLAGS ?= -lpthread -lrt
 
 # Target executable/binary name
 TARGET = aesdsocket
