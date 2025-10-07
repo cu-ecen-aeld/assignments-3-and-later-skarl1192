@@ -32,6 +32,41 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
     /**
     * TODO: implement per description
     */
+
+    uint8_t currentIndex;
+    size_t cumulativeOffset = 0;
+    
+    /* Check if buffer is empty. Must consider the full flag as well,
+     * since in_offs == out_offs can mean the buffer is either full or empty */
+    if (!buffer->full && buffer->in_offs == buffer->out_offs) {
+        return NULL;
+    }
+    
+    /* Start from output entry */
+    currentIndex = buffer->out_offs;
+    
+    /* Iterate through all entries in the buffer */
+    while (1) {
+        struct aesd_buffer_entry *currentEntry = &buffer->entry[currentIndex];
+        
+        /* Check if this entry contains the requested offset */
+        if (char_offset < cumulativeOffset + currentEntry->size) {
+            /* Found the entry containing the requested offset */
+            *entry_offset_byte_rtn = char_offset - cumulativeOffset;
+            return currentEntry;
+        }
+        
+        /* Move to the next entry */
+        cumulativeOffset += currentEntry->size;
+        currentIndex = (currentIndex + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        
+        /* Stop when we've wrapped around to in_offs */
+        if (currentIndex == buffer->in_offs) {
+            break;
+        }
+    }
+    
+    /* char_offset is beyond the available data */
     return NULL;
 }
 
@@ -47,6 +82,29 @@ void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const s
     /**
     * TODO: implement per description
     */
+
+    /* Since we are given the 'full' flag in the structure, we'll implement it
+     * that way as stated in lecture (since we can implement without the `full` flag,
+     * but would waste one index). When the buffer is full, we overwrite the oldest
+     * entry (at out_offs) and advance out_offs.
+     */
+    
+    /* Add the new entry at the in_offs position */
+    buffer->entry[buffer->in_offs] = *add_entry;
+    
+    /* If the buffer was full, we're overwriting the oldest entry
+     * so we need to advance out_offs to the next entry */
+    if (buffer->full) {
+        buffer->out_offs = (buffer->out_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    }
+    
+    /* Advance in_offs to the next position */
+    buffer->in_offs = (buffer->in_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    
+    /* If in_offs catches up to out_offs after advancing, the buffer is now full */
+    if (buffer->in_offs == buffer->out_offs) {
+        buffer->full = true;
+    }
 }
 
 /**
