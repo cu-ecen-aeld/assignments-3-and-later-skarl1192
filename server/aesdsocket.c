@@ -22,9 +22,20 @@
 #include <sys/time.h>
 
 /* ---- Macros ---- */
+/* Build switch to use /dev/aesdchar character device
+ * instead of /var/tmp/aesdsocketdata and also disable timestamp printing */
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
 #define SERVER_PORT 9000
 #define BUFFER_SIZE 40000
+
+#if USE_AESD_CHAR_DEVICE
+#define PACKET_FILE "/dev/aesdchar"
+#else
 #define PACKET_FILE "/var/tmp/aesdsocketdata"
+#endif
 
 /* ---- Thread Data Structure ---- */
 struct thread_data {
@@ -40,8 +51,10 @@ bool IntTermSignaled = false;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct thread_data *thread_list_head = NULL;
 pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+#if !USE_AESD_CHAR_DEVICE
 pthread_t timer_thread_id;
 timer_t timer_id;
+#endif
 
 /* Function declarations */
 static int send_file_to_client(int socketFd);
@@ -56,6 +69,7 @@ static void signal_handler(int signalNumber)
     }
 }
 
+#if !USE_AESD_CHAR_DEVICE
 /* Timer signal handler for timestamp writing */
 static void timer_handler(int sig, siginfo_t *si, void *uc)
 {
@@ -151,6 +165,7 @@ static void* timer_thread(void* arg)
     timer_delete(timer_id);
     return NULL;
 }
+#endif /* !USE_AESD_CHAR_DEVICE */
 
 /* Thread function to handle client connections */
 static void* handle_client(void* arg)
@@ -504,6 +519,7 @@ int main(int argc, char *argv[])
         syslog(LOG_INFO, "aesdsocket started as a daemon.");
     }
 
+#if !USE_AESD_CHAR_DEVICE
     /* Block SIGRTMIN signal for all threads. In the timer thread we will explicitly wait for it.
      * Note: The signal is delivered to the process, not to a specific thread.
      * The kernel picks ONE thread to handle the signal so we must block it on all
@@ -525,6 +541,7 @@ int main(int argc, char *argv[])
         closelog();
         return -1;
     }
+#endif
 
     /* Listen for incoming connections */
     if(listen(serverFd, 100) == -1)
@@ -596,8 +613,10 @@ int main(int argc, char *argv[])
     /* Wait for all threads to complete */
     cleanup_all_threads();
 
+#if !USE_AESD_CHAR_DEVICE
     /* Wait for timer thread to complete */
     pthread_join(timer_thread_id, NULL);
+#endif
 
     /* Close server socket */
     syslog(LOG_INFO, "Shutting down server.");
@@ -607,8 +626,10 @@ int main(int argc, char *argv[])
         serverFd = -1;
     }
 
+#if !USE_AESD_CHAR_DEVICE
     /* Delete the data file if it exists */
     remove(PACKET_FILE);
+#endif
 
     /* Close syslog connection */
     closelog();
