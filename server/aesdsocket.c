@@ -20,6 +20,9 @@
 #include <time.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <sys/ioctl.h>
+#include <limits.h>
+#include "../aesd-char-driver/aesd_ioctl.h"
 
 /* ---- Macros ---- */
 /* Build switch to use /dev/aesdchar character device
@@ -58,6 +61,8 @@ timer_t timer_id;
 
 /* Function declarations */
 static int send_file_to_client(int socketFd);
+static int send_file_to_client_fd(int socketFd, int fileFd);
+static bool parse_ioctl_seek_command(const char *buffer, size_t length, unsigned int *write_cmd, unsigned int *write_cmd_offset);
 
 
 static void signal_handler(int signalNumber)
@@ -167,6 +172,112 @@ static void* timer_thread(void* arg)
 }
 #endif /* !USE_AESD_CHAR_DEVICE */
 
+/**
+ * parse_ioctl_seek_command() - Parse AESDCHAR_IOCSEEKTO command string
+ * @buffer: Buffer containing the potential command string
+ * @length: Length of the buffer (should include newline)
+ * @write_cmd: Output parameter for the write command index (X value)
+ * @write_cmd_offset: Output parameter for the write command offset (Y value)
+ *
+ * Parses strings in the format "AESDCHAR_IOCSEEKTO:X,Y\n" where X and Y are
+ * unsigned decimal integers. The newline must be present as it marks the end
+ * of the command packet.
+ *
+ * Return: true if the buffer contains a valid AESDCHAR_IOCSEEKTO command,
+ *         false otherwise
+ */
+static bool parse_ioctl_seek_command(const char *buffer, size_t length, 
+                                     unsigned int *write_cmd, unsigned int *write_cmd_offset)
+{
+    /* Check minimum length: "AESDCHAR_IOCSEEKTO:0,0\n" = 23 chars */
+    if (length < 23) {
+        return false;
+    }
+    
+    /* Check if buffer ends with newline */
+    if (buffer[length - 1] != '\n') {
+        return false;
+    }
+    
+    /* Check if buffer starts with "AESDCHAR_IOCSEEKTO:" */
+    const char *prefix = "AESDCHAR_IOCSEEKTO:";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(buffer, prefix, prefix_len) != 0) {
+        return false;
+    }
+    
+    /* Parse X,Y values after the prefix */
+    const char *values_start = buffer + prefix_len;
+    char *comma_ptr = strchr(values_start, ',');
+    if (comma_ptr == NULL) {
+        return false;
+    }
+    
+    /* Parse X value (write_cmd) */
+    char *endptr;
+    unsigned long x_val = strtoul(values_start, &endptr, 10);
+    if (endptr != comma_ptr) {
+        return false;
+    }
+    
+    /* Parse Y value (write_cmd_offset) */
+    unsigned long y_val = strtoul(comma_ptr + 1, &endptr, 10);
+    if (endptr != (buffer + length - 1)) {
+        return false;
+    }
+    
+    *write_cmd = (unsigned int)x_val;
+    *write_cmd_offset = (unsigned int)y_val;
+    return true;
+}
+
+/**
+ * send_file_to_client_fd() - Send file contents to client using file descriptor
+ * @socketFd: Socket file descriptor to send data to
+ * @fileFd: File descriptor to read from (maintains file position across call)
+ *
+ * This function reads from the file descriptor and sends all data to the client.
+ * Unlike send_file_to_client(), this uses a file descriptor instead of FILE*,
+ * which allows the caller to perform ioctl operations and maintain file position
+ * across the read operation. The file position is honored and updated as data is read.
+ *
+ * Return: 0 on success, 1 on error
+ */
+static int send_file_to_client_fd(int socketFd, int fileFd)
+{
+    char buffer[BUFFER_SIZE];
+    ssize_t bytesRead = 0;
+    ssize_t bytesSent = 0;
+    ssize_t totalSent = 0;
+
+    /* Read file chunk by chunk from current file position and send */
+    while ((bytesRead = read(fileFd, buffer, BUFFER_SIZE)) > 0)
+    {
+        char *bufferPtr = buffer;
+        size_t remainingToSend = bytesRead;
+        while (remainingToSend > 0)
+        {
+            bytesSent = send(socketFd, bufferPtr, remainingToSend, 0);
+            if(bytesSent == -1)
+            {
+                if(errno == EINTR) continue;
+                syslog(LOG_ERR, "Error %d (%s) sending data to client", errno, strerror(errno));
+                return 1;
+            }
+            remainingToSend -= bytesSent;
+            bufferPtr += bytesSent;
+            totalSent += bytesSent;
+        }
+    }
+    
+    if (bytesRead < 0) {
+        syslog(LOG_ERR, "Error %d (%s) reading from file", errno, strerror(errno));
+        return 1;
+    }
+
+    return 0;
+}
+
 /* Thread function to handle client connections */
 static void* handle_client(void* arg)
 {
@@ -218,30 +329,87 @@ static void* handle_client(void* arg)
                 /* Found end of packet, signified by the newline character */
                 size_t packetLen = (newlineCharPtr - receiveBuffer) + 1;
 
-                /* Lock mutex before writing to file */
+                /* Check if this is an AESDCHAR_IOCSEEKTO command */
+                unsigned int write_cmd, write_cmd_offset;
+                bool is_ioctl_cmd = parse_ioctl_seek_command(receiveBuffer, packetLen, 
+                                                             &write_cmd, &write_cmd_offset);
+
+                /* Lock mutex before file operations */
                 pthread_mutex_lock(&file_mutex);
                 
-                /* Create/Open the data file to write/append to */
-                FILE* outputFilePtr = fopen(PACKET_FILE, "a");
-                if(outputFilePtr == NULL)
-                {
-                    syslog(LOG_ERR, "Error %d (%s) opening %s for appending", errno, strerror(errno), PACKET_FILE);
-                    pthread_mutex_unlock(&file_mutex);
-                    clientConnected = false;
-                    break; // break from newline processing loop
-                }
+                if (is_ioctl_cmd) {
+                    /* Open the device file with read/write access */
+                    FILE* filePtr = fopen(PACKET_FILE, "r+");
+                    if (filePtr == NULL) {
+                        syslog(LOG_ERR, "Error %d (%s) opening %s for ioctl", errno, strerror(errno), PACKET_FILE);
+                        pthread_mutex_unlock(&file_mutex);
+                        clientConnected = false;
+                        break;
+                    }
+                    
+                    /* Get the underlying file descriptor from the FILE* */
+                    int fileFd = fileno(filePtr);
+                    if (fileFd < 0) {
+                        syslog(LOG_ERR, "Error %d (%s) getting file descriptor", errno, strerror(errno));
+                        fclose(filePtr);
+                        pthread_mutex_unlock(&file_mutex);
+                        clientConnected = false;
+                        break;
+                    }
+                    
+                    /* Prepare ioctl structure */
+                    struct aesd_seekto seekto;
+                    seekto.write_cmd = write_cmd;
+                    seekto.write_cmd_offset = write_cmd_offset;
+                    
+                    /* Send AESDCHAR_IOCSEEKTO ioctl to the driver */
+                    if (ioctl(fileFd, AESDCHAR_IOCSEEKTO, &seekto) != 0) {
+                        syslog(LOG_ERR, "Error %d (%s) ioctl AESDCHAR_IOCSEEKTO failed (cmd=%u, offset=%u)", 
+                               errno, strerror(errno), write_cmd, write_cmd_offset);
+                        fclose(filePtr);
+                        pthread_mutex_unlock(&file_mutex);
+                        clientConnected = false;
+                        break;
+                    }
+                    
+                    /* Send file contents to client starting from the seeked position */
+                    /* Use the same file descriptor to honor the file position set by ioctl */
+                    if (send_file_to_client_fd(clientFd, fileFd) != 0) {
+                        /* Error sending file content, assume client disconnected */
+                        fclose(filePtr);
+                        pthread_mutex_unlock(&file_mutex);
+                        clientConnected = false;
+                        break;
+                    }
+                    
+                    /* Close the file */
+                    fclose(filePtr);
+                    
+                } else {
+                    /* Normal packet - write to file and send back contents */
+                    
+                    /* Create/Open the data file to write/append to */
+                    FILE* outputFilePtr = fopen(PACKET_FILE, "a");
+                    if(outputFilePtr == NULL)
+                    {
+                        syslog(LOG_ERR, "Error %d (%s) opening %s for appending", errno, strerror(errno), PACKET_FILE);
+                        pthread_mutex_unlock(&file_mutex);
+                        clientConnected = false;
+                        break; // break from newline processing loop
+                    }
 
-                /* Append to file, including the newline character */
-                fwrite(receiveBuffer, 1, packetLen, outputFilePtr);
-                fclose(outputFilePtr);
+                    /* Append to file, including the newline character */
+                    fwrite(receiveBuffer, 1, packetLen, outputFilePtr);
+                    fclose(outputFilePtr);
 
-                /* Send file to client */
-                if(send_file_to_client(clientFd) != 0)
-                {
-                    /* Error sending file content, assume client disconnected */
-                    pthread_mutex_unlock(&file_mutex);
-                    clientConnected = false;
-                    break; // break from newline processing loop
+                    /* Send file to client */
+                    if(send_file_to_client(clientFd) != 0)
+                    {
+                        /* Error sending file content, assume client disconnected */
+                        pthread_mutex_unlock(&file_mutex);
+                        clientConnected = false;
+                        break; // break from newline processing loop
+                    }
                 }
 
                 /* Unlock mutex after file operations */
