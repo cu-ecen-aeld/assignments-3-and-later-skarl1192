@@ -337,21 +337,11 @@ static void* handle_client(void* arg)
                 /* Lock mutex before file operations */
                 pthread_mutex_lock(&file_mutex);
                 
-                if (is_ioctl_cmd) {
-                    /* Open the device file with read/write access */
-                    FILE* filePtr = fopen(PACKET_FILE, "r+");
-                    if (filePtr == NULL) {
-                        syslog(LOG_ERR, "Error %d (%s) opening %s for ioctl", errno, strerror(errno), PACKET_FILE);
-                        pthread_mutex_unlock(&file_mutex);
-                        clientConnected = false;
-                        break;
-                    }
-                    
-                    /* Get the underlying file descriptor from the FILE* */
-                    int fileFd = fileno(filePtr);
+                if (is_ioctl_cmd) {                    
+                    /* Open the device file with read/write access using file descriptor */
+                    int fileFd = open(PACKET_FILE, O_RDWR);
                     if (fileFd < 0) {
-                        syslog(LOG_ERR, "Error %d (%s) getting file descriptor", errno, strerror(errno));
-                        fclose(filePtr);
+                        syslog(LOG_ERR, "Error %d (%s) opening %s for ioctl", errno, strerror(errno), PACKET_FILE);
                         pthread_mutex_unlock(&file_mutex);
                         clientConnected = false;
                         break;
@@ -362,11 +352,14 @@ static void* handle_client(void* arg)
                     seekto.write_cmd = write_cmd;
                     seekto.write_cmd_offset = write_cmd_offset;
                     
-                    /* Send AESDCHAR_IOCSEEKTO ioctl to the driver */
-                    if (ioctl(fileFd, AESDCHAR_IOCSEEKTO, &seekto) != 0) {
+                    /* Send AESDCHAR_IOCSEEKTO ioctl to the driver
+                     * The ioctl returns the new file position on success (>= 0)
+                     * or a negative error code on failure */
+                    long ioctl_result = ioctl(fileFd, AESDCHAR_IOCSEEKTO, &seekto);
+                    if (ioctl_result < 0) {
                         syslog(LOG_ERR, "Error %d (%s) ioctl AESDCHAR_IOCSEEKTO failed (cmd=%u, offset=%u)", 
                                errno, strerror(errno), write_cmd, write_cmd_offset);
-                        fclose(filePtr);
+                        close(fileFd);
                         pthread_mutex_unlock(&file_mutex);
                         clientConnected = false;
                         break;
@@ -376,14 +369,14 @@ static void* handle_client(void* arg)
                     /* Use the same file descriptor to honor the file position set by ioctl */
                     if (send_file_to_client_fd(clientFd, fileFd) != 0) {
                         /* Error sending file content, assume client disconnected */
-                        fclose(filePtr);
+                        close(fileFd);
                         pthread_mutex_unlock(&file_mutex);
                         clientConnected = false;
                         break;
                     }
                     
-                    /* Close the file */
-                    fclose(filePtr);
+                    /* Close the file descriptor */
+                    close(fileFd);
                     
                 } else {
                     /* Normal packet - write to file and send back contents */
