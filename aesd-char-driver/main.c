@@ -30,6 +30,9 @@ MODULE_LICENSE("Dual BSD/GPL");
 
 struct aesd_dev aesd_device;
 
+/* Forward declarations */
+static size_t aesd_get_total_size(struct aesd_dev *dev);
+
 /**
  * aesd_open() - Device open operation handler
  * @inode: Pointer to inode structure representing the device file
