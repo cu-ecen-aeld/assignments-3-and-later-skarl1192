@@ -1,0 +1,31 @@
+#!/bin/sh
+
+### BEGIN INIT INFO
+# Provides:          aesdchar
+# Required-Start:    $syslog
+# Required-Stop:     $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Load aesdchar module
+# Description:       Load aesdchar module
+### END INIT INFO
+
+MODDIR="/lib/modules/$(uname -r)/updates"
+
+case "$1" in
+start)
+    echo "Loading aesdchar-char-driver module"
+    # aesdchar_load expects to be run from the directory containing the .ko file
+    (cd $MODDIR && /usr/bin/aesdchar_load)
+    ;;
+stop)
+    echo "Unloading aesdchar-char-driver module"
+    /usr/bin/aesdchar_unload
+    ;;
+*)
+    echo "Usage: $0 {start|stop}"
+    exit 1
+    ;;
+esac
+
+exit 0

@@ -16,8 +16,10 @@ set -e
 # Group: since distributions do it differently, look for wheel or use staff
 if grep -q '^staff:' /etc/group; then
     group="staff"
-else
+elif grep -q '^wheel:' /etc/group; then
     group="wheel"
+else
+    group="root"
 fi
 
 if [ -e ${module}.ko ]; then
