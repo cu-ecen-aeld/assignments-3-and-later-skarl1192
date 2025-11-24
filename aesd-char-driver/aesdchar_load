@@ -2,7 +2,16 @@
 module=aesdchar
 device=aesdchar
 mode="664"
-cd `dirname $0`
+
+# Only change directory if the module is not in the current directory
+# This allows the script to be run from the directory where the module is located
+# (e.g. by the init script) without forcing a change to the script directory
+if [ ! -e ./${module}.ko ]; then
+    if [ -e $(dirname $0)/${module}.ko ]; then
+        cd $(dirname $0)
+    fi
+fi
+
 set -e
 # Group: since distributions do it differently, look for wheel or use staff
 if grep -q '^staff:' /etc/group; then
