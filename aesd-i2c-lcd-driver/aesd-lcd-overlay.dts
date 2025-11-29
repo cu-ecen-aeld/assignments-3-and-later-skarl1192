@@ -1,0 +1,22 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    /* Compatible with generic Pi (2835), Pi 4 (2711), and Pi 5 (2712) */
+    compatible = "brcm,bcm2835", "brcm,bcm2711", "brcm,bcm2712";
+
+    fragment@0 {
+        target = <&i2c1>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            lcd_screen: lcd@27 {
+                /* Matches the lcd_driver.c struct of_device_id */
+                compatible = "freenove,lcd"; 
+                reg = <0x27>;
+            };
+        };
+    };
+};
