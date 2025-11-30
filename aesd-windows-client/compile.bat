@@ -1,0 +1,1 @@
+g++ aesd_windows_client.cpp -o aesd_windows_client.exe -lws2_32

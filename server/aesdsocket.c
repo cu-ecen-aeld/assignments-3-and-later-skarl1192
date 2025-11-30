@@ -1,6 +1,9 @@
 /* Define to include sigaction related functionality */
 #define _POSIX_C_SOURCE 200809L
 
+/* ---- Configuration Switch ---- */
+#define USE_LCD_DEVICE 1
+
 /* ---- Includes ---- */
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,23 +25,29 @@
 #include <sys/time.h>
 #include <sys/ioctl.h>
 #include <limits.h>
-#include "../aesd-char-driver/aesd_ioctl.h"
 
-/* ---- Macros ---- */
-/* Build switch to use /dev/aesdchar character device
- * instead of /var/tmp/aesdsocketdata and also disable timestamp printing */
-#ifndef USE_AESD_CHAR_DEVICE
-#define USE_AESD_CHAR_DEVICE 1
+/* ---- Device Selection Logic ---- */
+#ifdef USE_LCD_DEVICE
+    #include "../aesd-i2c-lcd-driver/aesd_lcd_ioctl.h"
+    #define PACKET_FILE "/dev/aesdlcd"
+    /* Disable the AESD Char Device timestamp logic if we are using the LCD */
+    #undef USE_AESD_CHAR_DEVICE
+    #define USE_AESD_CHAR_DEVICE 1 
+#else
+    #ifndef USE_AESD_CHAR_DEVICE
+        #define USE_AESD_CHAR_DEVICE 1
+    #endif
+
+    #if USE_AESD_CHAR_DEVICE
+        #include "../aesd-char-driver/aesd_ioctl.h"
+        #define PACKET_FILE "/dev/aesdchar"
+    #else
+        #define PACKET_FILE "/var/tmp/aesdsocketdata"
+    #endif
 #endif
 
 #define SERVER_PORT 9000
 #define BUFFER_SIZE 40000
-
-#if USE_AESD_CHAR_DEVICE
-#define PACKET_FILE "/dev/aesdchar"
-#else
-#define PACKET_FILE "/var/tmp/aesdsocketdata"
-#endif
 
 /* ---- Thread Data Structure ---- */
 struct thread_data {
@@ -54,6 +63,7 @@ bool IntTermSignaled = false;
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct thread_data *thread_list_head = NULL;
 pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 #if !USE_AESD_CHAR_DEVICE
 pthread_t timer_thread_id;
 timer_t timer_id;
@@ -63,6 +73,94 @@ timer_t timer_id;
 static int send_file_to_client(int socketFd);
 static int send_file_to_client_fd(int socketFd, int fileFd);
 static bool parse_ioctl_seek_command(const char *buffer, size_t length, unsigned int *write_cmd, unsigned int *write_cmd_offset);
+
+/* * Helper for LCD Command Parsing 
+ */
+#ifdef USE_LCD_DEVICE
+/**
+ * parse_lcd_command() - Parse incoming strings for LCD IOCTLs
+ * @buffer: The data buffer
+ * @length: Length of data
+ * @cmd_ioctl: Output pointer for the specific IOCTL command (e.g., LCD_CLEAR)
+ * @cmd_val: Output pointer for the argument value (e.g., the cursor position int)
+ * * Protocol Support:
+ * LCD:CLEAR            -> LCD_CLEAR
+ * LCD:HOME             -> LCD_HOME
+ * LCD:CURSOR:r,c       -> LCD_SET_CURSOR (row << 8 | col)
+ * LCD:BACKLIGHT:1|0    -> LCD_BACKLIGHT
+ * LCD:DISPLAY:1|0      -> LCD_DISPLAY_SWITCH
+ * LCD:UNDERLINE:1|0    -> LCD_CURSOR_SWITCH
+ * LCD:BLINK:1|0        -> LCD_BLINK_SWITCH
+ * LCD:SCROLL:0|1       -> LCD_SCROLL (0=Left, 1=Right)
+ * LCD:TEXTDIR:0|1      -> LCD_TEXT_DIR (0=RTL, 1=LTR)
+ * LCD:AUTOSCROLL:1|0   -> LCD_AUTOSCROLL
+ */
+static bool parse_lcd_command(const char *buffer, size_t length, 
+                              unsigned int *cmd_ioctl, unsigned long *cmd_val)
+{
+    /* Minimum length check for "LCD:" + 1 char */
+    if (length < 5 || strncmp(buffer, "LCD:", 4) != 0) return false;
+
+    /* Pointer to start of command after prefix */
+    const char *p = buffer + 4;
+
+    /* Handle Commands */
+    if (strncmp(p, "CLEAR", 5) == 0) {
+        *cmd_ioctl = LCD_CLEAR;
+        return true;
+    }
+    if (strncmp(p, "HOME", 4) == 0) {
+        *cmd_ioctl = LCD_HOME;
+        return true;
+    }
+    if (strncmp(p, "CURSOR:", 7) == 0) {
+        *cmd_ioctl = LCD_SET_CURSOR;
+        int r = 0, c = 0;
+        if (sscanf(p + 7, "%d,%d", &r, &c) == 2) {
+            *cmd_val = (r << 8) | c;
+            return true;
+        }
+        return false;
+    }
+    if (strncmp(p, "BACKLIGHT:", 10) == 0) {
+        *cmd_ioctl = LCD_BACKLIGHT;
+        *cmd_val = atoi(p + 10);
+        return true;
+    }
+    if (strncmp(p, "DISPLAY:", 8) == 0) {
+        *cmd_ioctl = LCD_DISPLAY_SWITCH;
+        *cmd_val = atoi(p + 8);
+        return true;
+    }
+    if (strncmp(p, "UNDERLINE:", 10) == 0) {
+        *cmd_ioctl = LCD_CURSOR_SWITCH;
+        *cmd_val = atoi(p + 10);
+        return true;
+    }
+    if (strncmp(p, "BLINK:", 6) == 0) {
+        *cmd_ioctl = LCD_BLINK_SWITCH;
+        *cmd_val = atoi(p + 6);
+        return true;
+    }
+    if (strncmp(p, "SCROLL:", 7) == 0) {
+        *cmd_ioctl = LCD_SCROLL;
+        *cmd_val = atoi(p + 7);
+        return true;
+    }
+    if (strncmp(p, "TEXTDIR:", 8) == 0) {
+        *cmd_ioctl = LCD_TEXT_DIR;
+        *cmd_val = atoi(p + 8);
+        return true;
+    }
+    if (strncmp(p, "AUTOSCROLL:", 11) == 0) {
+        *cmd_ioctl = LCD_AUTOSCROLL;
+        *cmd_val = atoi(p + 11);
+        return true;
+    }
+
+    return false;
+}
+#endif
 
 
 static void signal_handler(int signalNumber)
@@ -144,7 +242,7 @@ static void* timer_thread(void* arg)
             
             /* Format timestamp according to RFC 2822 */
             strftime(timestamp_buffer, sizeof(timestamp_buffer), 
-                    "timestamp:%a, %d %b %Y %H:%M:%S %z\n", time_info);
+                     "timestamp:%a, %d %b %Y %H:%M:%S %z\n", time_info);
             
             /* Lock mutex and write timestamp to file */
             pthread_mutex_lock(&file_mutex);
@@ -174,17 +272,6 @@ static void* timer_thread(void* arg)
 
 /**
  * parse_ioctl_seek_command() - Parse AESDCHAR_IOCSEEKTO command string
- * @buffer: Buffer containing the potential command string
- * @length: Length of the buffer (should include newline)
- * @write_cmd: Output parameter for the write command index (X value)
- * @write_cmd_offset: Output parameter for the write command offset (Y value)
- *
- * Parses strings in the format "AESDCHAR_IOCSEEKTO:X,Y\n" where X and Y are
- * unsigned decimal integers. The newline must be present as it marks the end
- * of the command packet.
- *
- * Return: true if the buffer contains a valid AESDCHAR_IOCSEEKTO command,
- *         false otherwise
  */
 static bool parse_ioctl_seek_command(const char *buffer, size_t length, 
                                      unsigned int *write_cmd, unsigned int *write_cmd_offset)
@@ -233,15 +320,6 @@ static bool parse_ioctl_seek_command(const char *buffer, size_t length,
 
 /**
  * send_file_to_client_fd() - Send file contents to client using file descriptor
- * @socketFd: Socket file descriptor to send data to
- * @fileFd: File descriptor to read from (maintains file position across call)
- *
- * This function reads from the file descriptor and sends all data to the client.
- * Unlike send_file_to_client(), this uses a file descriptor instead of FILE*,
- * which allows the caller to perform ioctl operations and maintain file position
- * across the read operation. The file position is honored and updated as data is read.
- *
- * Return: 0 on success, 1 on error
  */
 static int send_file_to_client_fd(int socketFd, int fileFd)
 {
@@ -303,7 +381,26 @@ static void* handle_client(void* arg)
     /* While client is connected and SIGINT/SIGTERM not received */
     while (clientConnected && !IntTermSignaled)
     {
-        bytesReceived = recv(clientFd, receiveBuffer, sizeof(receiveBuffer), 0);
+        /* Check for buffer space */
+        if (receiveBufferLen >= BUFFER_SIZE) {
+            /* Buffer is full and no newline was found. 
+             * Flush current buffer to file to avoid sticking. 
+             * This effectively treats the overflow as raw text. */
+            syslog(LOG_ERR, "Buffer overflow, flushing raw data.");
+            
+            pthread_mutex_lock(&file_mutex);
+            FILE* outputFilePtr = fopen(PACKET_FILE, "a");
+            if(outputFilePtr) {
+                fwrite(receiveBuffer, 1, receiveBufferLen, outputFilePtr);
+                fclose(outputFilePtr);
+            }
+            pthread_mutex_unlock(&file_mutex);
+            
+            receiveBufferLen = 0;
+        }
+
+        /* Receive data, APPENDING to the buffer instead of overwriting */
+        bytesReceived = recv(clientFd, receiveBuffer + receiveBufferLen, BUFFER_SIZE - receiveBufferLen, 0);
 
         if(bytesReceived == -1)
         {
@@ -329,17 +426,38 @@ static void* handle_client(void* arg)
                 /* Found end of packet, signified by the newline character */
                 size_t packetLen = (newlineCharPtr - receiveBuffer) + 1;
 
-                /* Check if this is an AESDCHAR_IOCSEEKTO command */
-                unsigned int write_cmd, write_cmd_offset;
-                bool is_ioctl_cmd = parse_ioctl_seek_command(receiveBuffer, packetLen, 
-                                                             &write_cmd, &write_cmd_offset);
+                syslog(LOG_INFO, "Received command: %.*s", (int)packetLen, receiveBuffer);
+
+                /* --- COMMAND PARSING LOGIC --- */
+                bool is_ioctl_cmd = false;
+                unsigned int ioctl_cmd = 0;
+                
+                /* Variable to hold IOCTL argument */
+                /* For LCD this is a direct long value, for AESDCHAR it's part of a struct */
+                unsigned long ioctl_arg_val = 0; 
+                unsigned int write_cmd_offset = 0;
+                
+                #ifdef USE_LCD_DEVICE
+                    /* LCD Command Parsing */
+                    /* Remove newline for parsing logic */
+                    is_ioctl_cmd = parse_lcd_command(receiveBuffer, packetLen, &ioctl_cmd, &ioctl_arg_val);
+                #else
+                    /* AESD Char Parsing */
+                    is_ioctl_cmd = parse_ioctl_seek_command(receiveBuffer, packetLen, 
+                                                            &ioctl_cmd, &write_cmd_offset);
+                #endif
 
                 /* Lock mutex before file operations */
                 pthread_mutex_lock(&file_mutex);
                 
-                if (is_ioctl_cmd) {                    
+                if (is_ioctl_cmd) {                     
                     /* Open the device file with read/write access using file descriptor */
+                    syslog(LOG_INFO, "Writing command to aesdlcd");
+                #ifdef USE_LCD_DEVICE
+                    int fileFd = open(PACKET_FILE, O_WRONLY);
+                #else
                     int fileFd = open(PACKET_FILE, O_RDWR);
+                #endif
                     if (fileFd < 0) {
                         syslog(LOG_ERR, "Error %d (%s) opening %s for ioctl", errno, strerror(errno), PACKET_FILE);
                         pthread_mutex_unlock(&file_mutex);
@@ -347,40 +465,77 @@ static void* handle_client(void* arg)
                         break;
                     }
                     
-                    /* Prepare ioctl structure */
-                    struct aesd_seekto seekto;
-                    seekto.write_cmd = write_cmd;
-                    seekto.write_cmd_offset = write_cmd_offset;
-                    
-                    /* Send AESDCHAR_IOCSEEKTO ioctl to the driver
-                     * The ioctl returns the new file position on success (>= 0)
-                     * or a negative error code on failure */
-                    long ioctl_result = ioctl(fileFd, AESDCHAR_IOCSEEKTO, &seekto);
-                    if (ioctl_result < 0) {
-                        syslog(LOG_ERR, "Error %d (%s) ioctl AESDCHAR_IOCSEEKTO failed (cmd=%u, offset=%u)", 
-                               errno, strerror(errno), write_cmd, write_cmd_offset);
+                    long ioctl_result = 0;
+
+                    #ifdef USE_LCD_DEVICE
+                        /* EXECUTE LCD IOCTL */
+                        /* The LCD driver expects the value directly in the arg parameter */
+                        ioctl_result = ioctl(fileFd, ioctl_cmd, ioctl_arg_val);
+                        if (ioctl_result < 0) {
+                            syslog(LOG_ERR, "Error %d (%s) ioctl failed", errno, strerror(errno));
+                        }
+                        /* LCD is write-only, close and continue - no read back needed */
                         close(fileFd);
-                        pthread_mutex_unlock(&file_mutex);
-                        clientConnected = false;
-                        break;
-                    }
+                    #else
+                        /* EXECUTE AESD CHAR IOCTL */
+                        struct aesd_seekto seekto;
+                        seekto.write_cmd = ioctl_cmd;
+                        seekto.write_cmd_offset = write_cmd_offset;
+                        ioctl_result = ioctl(fileFd, AESDCHAR_IOCSEEKTO, &seekto);
                     
-                    /* Send file contents to client starting from the seeked position */
-                    /* Use the same file descriptor to honor the file position set by ioctl */
-                    if (send_file_to_client_fd(clientFd, fileFd) != 0) {
-                        /* Error sending file content, assume client disconnected */
+                        if (ioctl_result < 0) {
+                            syslog(LOG_ERR, "Error %d (%s) ioctl failed", errno, strerror(errno));
+                            close(fileFd);
+                            pthread_mutex_unlock(&file_mutex);
+                            clientConnected = false;
+                            break;
+                        }
+                        
+                        /* Send file contents to client starting from the seeked position */
+                        /* Use the same file descriptor to honor the file position set by ioctl */
+                        if (send_file_to_client_fd(clientFd, fileFd) != 0) {
+                            /* Error sending file content, assume client disconnected */
+                            close(fileFd);
+                            pthread_mutex_unlock(&file_mutex);
+                            clientConnected = false;
+                            break;
+                        }
+                        
+                        /* Close the file descriptor */
                         close(fileFd);
-                        pthread_mutex_unlock(&file_mutex);
-                        clientConnected = false;
-                        break;
-                    }
-                    
-                    /* Close the file descriptor */
-                    close(fileFd);
+                    #endif
                     
                 } else {
                     /* Normal packet - write to file and send back contents */
+                    syslog(LOG_INFO, "Writing command to aesdlcd: %.*s", (int)packetLen, receiveBuffer);
                     
+                #ifdef USE_LCD_DEVICE
+                    /* For LCD device: use open()/write() and strip the newline character
+                     * since the HD44780 LCD cannot display newlines as printable characters */
+                    int fileFd = open(PACKET_FILE, O_WRONLY);
+                    if (fileFd < 0) {
+                        syslog(LOG_ERR, "Error %d (%s) opening %s for writing", errno, strerror(errno), PACKET_FILE);
+                        pthread_mutex_unlock(&file_mutex);
+                        clientConnected = false;
+                        break;
+                    }
+                    
+                    /* Write all characters except the trailing newline */
+                    size_t writeLen = packetLen;
+                    if (writeLen > 0 && receiveBuffer[writeLen - 1] == '\n') {
+                        writeLen--;
+                    }
+                    
+                    if (writeLen > 0) {
+                        ssize_t written = write(fileFd, receiveBuffer, writeLen);
+                        if (written < 0) {
+                            syslog(LOG_ERR, "Error %d (%s) writing to LCD", errno, strerror(errno));
+                        }
+                    }
+                    close(fileFd);
+                    
+                    /* LCD is write-only, no need to send anything back to client */
+                #else
                     /* Create/Open the data file to write/append to */
                     FILE* outputFilePtr = fopen(PACKET_FILE, "a");
                     if(outputFilePtr == NULL)
@@ -403,6 +558,7 @@ static void* handle_client(void* arg)
                         clientConnected = false;
                         break; // break from newline processing loop
                     }
+                #endif
                 }
 
                 /* Unlock mutex after file operations */
@@ -417,33 +573,12 @@ static void* handle_client(void* arg)
                 receiveBufferLen = remainingLen;
             }
 
-            /* If there are remaining bytes in the buffer, write them to file
-             * Don't send the file to the connected client until full packet */
-            if(receiveBufferLen > 0)
-            {
-                /* Lock mutex before writing to file */
-                pthread_mutex_lock(&file_mutex);
-                
-                FILE* outputFilePtr = fopen(PACKET_FILE, "a");
-                if(outputFilePtr == NULL)
-                {
-                    syslog(LOG_ERR, "Error %d (%s) opening %s for appending", errno, strerror(errno), PACKET_FILE);
-                    pthread_mutex_unlock(&file_mutex);
-                    clientConnected = false;
-                }
-                else
-                {
-                    fwrite(receiveBuffer, 1, receiveBufferLen, outputFilePtr);
-                    fclose(outputFilePtr);
-                    pthread_mutex_unlock(&file_mutex);
-                    receiveBufferLen = 0;
-                }
-            }
+            /* Loop back to recv to append more data until we find a newline. */
         }
     }
 
     /* Cleanup after client disconnection */
-    if(clientFd != -1)
+        if(clientFd != -1)
     {
         close(clientFd);
         syslog(LOG_INFO, "Closed connection from %s", clientIpStr);
@@ -572,7 +707,7 @@ int main(int argc, char *argv[])
         }
         else
         {
-            fprintf(stderr, "Usage: %s [-d]\n", argv[0]);
+            syslog(LOG_ERR, "Usage: %s [-d]", argv[0]);
             return 1;
         }
     }

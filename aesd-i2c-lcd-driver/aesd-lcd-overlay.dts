@@ -1,22 +1,22 @@
-/dts-v1/;
-/plugin/;
+/dts-v1/;                           // Specifies the version of the Device Tree format being used.
+/plugin/;                           // Declares this file as an overlay (DTO) designed to patch the base DTB.
 
 / {
-    /* Compatible with generic Pi (2835), Pi 4 (2711), and Pi 5 (2712) */
-    compatible = "brcm,bcm2835", "brcm,bcm2711", "brcm,bcm2712";
+	/* Compatible with generic Pi (2835), Pi 4 (2711), and Pi 5 (2712) */
+	compatible = "brcm,bcm2835", "brcm,bcm2711", "brcm,bcm2712"; 
 
-    fragment@0 {
-        target = <&i2c1>;
-        __overlay__ {
-            #address-cells = <1>;
-            #size-cells = <0>;
-            status = "okay";
+	fragment@0 {                        // Starts a fragment block containing the patch.
+		target = <&i2c1>;               // Directs this fragment to patch the node labeled 'i2c1' (I2C bus 1). Corresponds to GPIO pin 2 (SDA) and GPIO pin 3 (SCL).
+		__overlay__ {                   // Marks the properties within this block as additions/changes to the target node.
+			#address-cells = <1>;       // Standard I2C property: Specifies that one cell is used to identify a device's address.
+			#size-cells = <0>;          // Standard I2C property: Specifies that no cells are used to define the size/length of a device.
+			status = "okay";            // Enable the the I2C bus (i2c1).
 
-            lcd_screen: lcd@27 {
-                /* Matches the lcd_driver.c struct of_device_id */
-                compatible = "freenove,lcd"; 
-                reg = <0x27>;
-            };
-        };
-    };
+			lcd_screen: lcd@27 {        // Defines a new child node for the LCD device, using the address 0x27 as a label hint.
+				/* Matches the lcd_driver.c struct of_device_id */
+				compatible = "freenove,lcd"; // This string must match the `of_match_table` in the kernel driver's source code, telling the kernel which driver to load.
+				reg = <0x27>;                // Specifies the I2C slave address (0x27)
+			};
+		};
+	};
 };
